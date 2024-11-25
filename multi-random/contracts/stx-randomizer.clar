@@ -13,6 +13,10 @@
 (define-constant ERROR_BLACKLISTED_ADDRESS (err u107))
 (define-constant ERROR_INSUFFICIENT_ENTROPY (err u108))
 (define-constant ERROR_SYSTEM_PAUSED (err u109))
+(define-constant ERROR_METRICS_UPDATE_FAILED (err u110))
+
+;; Response type definitions
+(define-constant SUCCESS_RESPONSE (ok true))
 
 ;; Configuration constants
 (define-constant MAXIMUM_SEQUENCE_LENGTH u100)
@@ -64,7 +68,9 @@
 
 ;; Private administrative functions
 (define-private (verify-contract-owner-access)
-    (ok (asserts! (is-eq tx-sender contract-deployment-owner) ERROR_NOT_CONTRACT_OWNER))
+    (if (is-eq tx-sender contract-deployment-owner)
+        SUCCESS_RESPONSE
+        ERROR_NOT_CONTRACT_OWNER)
 )
 
 (define-private (validate-generation-prerequisites)
@@ -73,20 +79,32 @@
         (asserts! (not (default-to false (map-get? blacklisted-addresses tx-sender))) ERROR_BLACKLISTED_ADDRESS)
         (asserts! (>= (var-get entropy-pool) MINIMUM_ENTROPY_REQUIRED) ERROR_INSUFFICIENT_ENTROPY)
         (asserts! (> block-height (+ (var-get last-generation-block) COOLDOWN_BLOCKS)) ERROR_COOLDOWN_PERIOD_ACTIVE)
-        (ok true)
+        SUCCESS_RESPONSE
     )
 )
 
 (define-private (calculate-cryptographic-hash (random-input-value uint))
-    (to-uint (sha256 (concat 
-        (unwrap-panic (to-sequence (var-get random-generation-sequence-number)))
-        (unwrap-panic (to-sequence random-input-value))
-        (unwrap-panic (to-sequence block-height))
-        (unwrap-panic (to-sequence (var-get entropy-pool)))
-    )))
+    (let (
+        (input (concat 
+            (unwrap-panic (to-consensus-buff? (var-get random-generation-sequence-number)))
+            (unwrap-panic (to-consensus-buff? (xor 
+                (xor 
+                    random-input-value
+                    block-height
+                )
+                (var-get entropy-pool)
+            )))
+        ))
+        (hash-result (sha256 input))
+        (truncated-hash (match (slice? hash-result u0 u16)
+                slice-result (ok (unwrap-panic (as-max-len? slice-result u16)))
+                (err "Failed to slice buffer")))
+    )
+    (buff-to-uint-be (unwrap-panic truncated-hash))
+    )
 )
 
-(define-private (update-generation-metrics)
+(define-private (update-generation-metrics) 
     (begin
         (var-set total-generations (+ (var-get total-generations) u1))
         (var-set last-generation-block block-height)
@@ -94,7 +112,7 @@
         (map-set generation-results (var-get total-generations) (var-get latest-generated-random-number))
         (map-set user-generation-history tx-sender 
             (+ (default-to u0 (map-get? user-generation-history tx-sender)) u1))
-        (ok true)
+        SUCCESS_RESPONSE
     )
 )
 
@@ -123,20 +141,27 @@
 (define-public (add-entropy (entropy-value uint))
     (begin
         (var-set entropy-pool (+ (var-get entropy-pool) entropy-value))
-        (ok true)
+        SUCCESS_RESPONSE
     )
 )
 
 ;; Random number generation functions
 (define-public (generate-single-random-number)
-    (begin
-        (try! (validate-generation-prerequisites))
-        (var-set random-generation-sequence-number (+ (var-get random-generation-sequence-number) u1))
-        (var-set latest-generated-random-number (calculate-cryptographic-hash (var-get cryptographic-seed-value)))
-        (var-set cryptographic-seed-value (var-get latest-generated-random-number))
-        (var-set entropy-pool (- (var-get entropy-pool) u1))
-        (try! (update-generation-metrics))
-        (ok (var-get latest-generated-random-number))
+    (let
+        ((prerequisites-result (validate-generation-prerequisites)))
+        (match prerequisites-result
+            success-response 
+                (let
+                    ((random-value (calculate-cryptographic-hash (var-get cryptographic-seed-value))))
+                    (begin
+                        (var-set random-generation-sequence-number 
+                            (+ (var-get random-generation-sequence-number) u1))
+                        (var-set latest-generated-random-number random-value)
+                        (var-set cryptographic-seed-value random-value)
+                        (var-set entropy-pool (- (var-get entropy-pool) u1))
+                        (ok random-value)))
+            error-value (err error-value)
+        )
     )
 )
 
@@ -144,8 +169,9 @@
     (begin
         (asserts! (< range-minimum-value range-maximum-value) ERROR_NUMBER_RANGE_INVALID)
         (asserts! (<= (- range-maximum-value range-minimum-value) MAXIMUM_RANGE_SIZE) ERROR_NUMBER_RANGE_INVALID)
-        (try! (generate-single-random-number))
-        (ok (+ range-minimum-value (mod (var-get latest-generated-random-number) (- range-maximum-value range-minimum-value))))
+        (let ((random-value (try! (generate-single-random-number))))
+            (ok (+ range-minimum-value (mod random-value (- range-maximum-value range-minimum-value))))
+        )
     )
 )
 
@@ -154,28 +180,34 @@
         (asserts! (> sequence-length u0) ERROR_GENERATION_PARAMETERS_INVALID)
         (asserts! (<= sequence-length MAXIMUM_SEQUENCE_LENGTH) ERROR_MAXIMUM_SEQUENCE_LENGTH_EXCEEDED)
         (try! (validate-generation-prerequisites))
-        (let ((random-number-sequence (list)))
-            (ok (unwrap-panic (fold accumulate-random-numbers 
-                (list u1 u2 u3 u4 u5) 
-                random-number-sequence)))
+        (let 
+            (
+                (result (fold accumulate-random-numbers 
+                    (list u1 u2 u3 u4 u5) 
+                    {acc: (list), len: u0}))
+            )
+            (ok (get acc result))
         )
     )
 )
 
 (define-public (generate-random-percentage)
-    (begin
-        (try! (generate-single-random-number))
-        (ok (mod (var-get latest-generated-random-number) u101))
+    (let ((random-value (try! (generate-single-random-number))))
+        (ok (mod random-value u101))
     )
 )
 
-(define-private (accumulate-random-numbers (sequence-position uint) (accumulated-random-numbers (list 100 uint)))
-    (begin
-        (try! (generate-single-random-number))
-        (ok (unwrap-panic (as-max-len? 
-            (append accumulated-random-numbers (var-get latest-generated-random-number))
-            MAXIMUM_SEQUENCE_LENGTH
-        )))
+(define-private (accumulate-random-numbers (sequence-position uint) (state {acc: (list 100 uint), len: uint}))
+    (let 
+        (
+            (random-value (unwrap-panic (generate-single-random-number)))
+            (new-acc (unwrap-panic (as-max-len? (append (get acc state) random-value) u100)))
+            (new-len (+ (get len state) u1))
+        )
+        (if (< new-len MAXIMUM_SEQUENCE_LENGTH)
+            {acc: new-acc, len: new-len}
+            state
+        )
     )
 )
 
