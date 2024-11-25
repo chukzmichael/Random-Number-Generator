@@ -14,6 +14,8 @@
 (define-constant ERROR_INSUFFICIENT_ENTROPY (err u108))
 (define-constant ERROR_SYSTEM_PAUSED (err u109))
 (define-constant ERROR_METRICS_UPDATE_FAILED (err u110))
+(define-constant ERROR_INVALID_ADDRESS (err u111))
+(define-constant ERROR_INVALID_ENTROPY_VALUE (err u112))
 
 ;; Response type definitions
 (define-constant SUCCESS_RESPONSE (ok true))
@@ -23,6 +25,7 @@
 (define-constant MINIMUM_ENTROPY_REQUIRED u10)
 (define-constant COOLDOWN_BLOCKS u10)
 (define-constant MAXIMUM_RANGE_SIZE u1000000)
+(define-constant MAXIMUM_ENTROPY_VALUE u1000000)
 
 ;; Data variables for maintaining random number state
 (define-data-var latest-generated-random-number uint u0)
@@ -127,19 +130,26 @@
 (define-public (add-to-blacklist (address principal))
     (begin
         (try! (verify-contract-owner-access))
-        (ok (map-set blacklisted-addresses address true))
+        (match (principal-destruct? address)
+            success (ok (map-set blacklisted-addresses address true))
+            error ERROR_INVALID_ADDRESS
+        )
     )
 )
 
 (define-public (remove-from-blacklist (address principal))
     (begin
         (try! (verify-contract-owner-access))
-        (ok (map-delete blacklisted-addresses address))
+        (match (principal-destruct? address)
+            success (ok (map-delete blacklisted-addresses address))
+            error ERROR_INVALID_ADDRESS
+        )
     )
 )
 
 (define-public (add-entropy (entropy-value uint))
     (begin
+        (asserts! (<= entropy-value MAXIMUM_ENTROPY_VALUE) ERROR_INVALID_ENTROPY_VALUE)
         (var-set entropy-pool (+ (var-get entropy-pool) entropy-value))
         SUCCESS_RESPONSE
     )
@@ -184,7 +194,7 @@
             (
                 (result (fold accumulate-random-numbers 
                     (list u1 u2 u3 u4 u5) 
-                    {acc: (list), len: u0}))
+                    {acc: (list), len: u0, target: sequence-length}))
             )
             (ok (get acc result))
         )
@@ -197,15 +207,15 @@
     )
 )
 
-(define-private (accumulate-random-numbers (sequence-position uint) (state {acc: (list 100 uint), len: uint}))
+(define-private (accumulate-random-numbers (sequence-position uint) (state {acc: (list 100 uint), len: uint, target: uint}))
     (let 
         (
             (random-value (unwrap-panic (generate-single-random-number)))
-            (new-acc (unwrap-panic (as-max-len? (append (get acc state) random-value) u100)))
+            (new-acc (unwrap! (as-max-len? (append (get acc state) random-value) u100) state))
             (new-len (+ (get len state) u1))
         )
-        (if (< new-len MAXIMUM_SEQUENCE_LENGTH)
-            {acc: new-acc, len: new-len}
+        (if (< new-len (get target state))
+            {acc: new-acc, len: new-len, target: (get target state)}
             state
         )
     )
